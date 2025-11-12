@@ -89,9 +89,9 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="CUDA device id to use.")
     parser.add_argument(
-        "--skip_existing",
+        "--overwrite",
         action="store_true",
-        help="If set, do not re-generate clips that already exist in output_dir.")
+        help="Regenerate clips even if the corresponding output file already exists.")
     parser.add_argument(
         "--max_records",
         type=int,
@@ -112,19 +112,26 @@ def discover_annotation_files(root: Path) -> List[Path]:
     return json_files
 
 
-def build_prompt(record: dict) -> str:
-    parts: List[str] = []
-    for mask in record.get("masks", []):
+def extract_prompt_entries(record: dict) -> List[Tuple[str, str]]:
+    """Return (prompt_text, tag) pairs, one per mask (or top-level prompt)."""
+    entries: List[Tuple[str, str]] = []
+    masks = record.get("masks") or []
+    for idx, mask in enumerate(masks, start=1):
         prompt = (mask or {}).get("prompt", "").strip()
-        if prompt:
-            parts.append(prompt)
-    top_level_prompt = record.get("prompt", "")
-    if top_level_prompt:
-        parts.append(top_level_prompt.strip())
-    prompt = " ".join(parts).strip()
-    if not prompt:
+        if not prompt:
+            continue
+        mask_filename = (mask or {}).get("mask_filename")
+        tag = Path(mask_filename).stem if mask_filename else f"mask-{idx:03d}"
+        entries.append((prompt, tag))
+
+    if not entries:
+        top_level_prompt = (record.get("prompt") or "").strip()
+        if top_level_prompt:
+            entries.append((top_level_prompt, "prompt"))
+
+    if not entries:
         raise ValueError("Prompt information missing from annotation.")
-    return prompt
+    return entries
 
 
 def load_crop_image(record: dict, crop_dir: Path) -> Tuple[Path, Image.Image]:
@@ -192,52 +199,56 @@ def main() -> None:
     success, failures = 0, 0
     for index, (json_path, record) in enumerate(iter_annotations(json_files)):
         stem = json_path.stem
-        out_file = output_dir / f"{stem}.mp4"
-        if args.skip_existing and out_file.exists():
-            logging.info("Skipping %s (exists).", stem)
-            continue
-
         try:
-            prompt = build_prompt(record)
+            prompt_entries = extract_prompt_entries(record)
             crop_path, image = load_crop_image(record, crops_dir)
         except (ValueError, FileNotFoundError) as exc:
             logging.warning("Skipping %s: %s", json_path, exc)
             failures += 1
             continue
 
-        seed = args.base_seed
-        if seed >= 0:
-            seed += index
+        for prompt_idx, (prompt, tag) in enumerate(prompt_entries):
+            out_file = output_dir / f"{stem}_{tag}.mp4"
+            if out_file.exists() and not args.overwrite:
+                logging.info("Skipping %s/%s (detected %s).", stem, tag,
+                             out_file.name)
+                continue
 
-        logging.info("Generating video for %s using %s", stem, crop_path.name)
-        try:
-            video = wan_i2v.generate(
-                input_prompt=prompt,
-                img=image,
-                max_area=max_area,
-                frame_num=args.frame_num,
-                shift=sample_shift,
-                sample_solver=args.sample_solver,
-                sampling_steps=args.sample_steps,
-                guide_scale=args.sample_guide_scale,
-                seed=seed,
-                offload_model=offload_model,
+            seed = args.base_seed
+            if seed >= 0:
+                seed += index * 100 + prompt_idx
+
+            logging.info("Generating %s/%s using %s", stem, tag,
+                         crop_path.name)
+            try:
+                video = wan_i2v.generate(
+                    input_prompt=prompt,
+                    img=image,
+                    max_area=max_area,
+                    frame_num=args.frame_num,
+                    shift=sample_shift,
+                    sample_solver=args.sample_solver,
+                    sampling_steps=args.sample_steps,
+                    guide_scale=args.sample_guide_scale,
+                    seed=seed,
+                    offload_model=offload_model,
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                logging.exception("Generation failed for %s/%s: %s", stem, tag,
+                                  exc)
+                failures += 1
+                continue
+
+            cache_video(
+                tensor=video[None],
+                save_file=str(out_file),
+                fps=cfg.sample_fps,
+                nrow=1,
+                normalize=True,
+                value_range=(-1, 1),
             )
-        except Exception as exc:  # pylint: disable=broad-except
-            logging.exception("Generation failed for %s: %s", stem, exc)
-            failures += 1
-            continue
-
-        cache_video(
-            tensor=video[None],
-            save_file=str(out_file),
-            fps=cfg.sample_fps,
-            nrow=1,
-            normalize=True,
-            value_range=(-1, 1),
-        )
-        success += 1
-        logging.info("Saved %s", out_file)
+            success += 1
+            logging.info("Saved %s", out_file)
 
     logging.info(
         "Done. Successful clips: %d | Failed: %d | Output dir: %s",
