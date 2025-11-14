@@ -135,14 +135,54 @@ def extract_prompt_entries(record: dict) -> List[Tuple[str, str]]:
 
 
 def load_crop_image(record: dict, crop_dir: Path) -> Tuple[Path, Image.Image]:
+    """Resolve and load the crop image for an annotation entry."""
+    candidates: List[Path] = []
+
+    def _push_candidate(path_like: str) -> None:
+        if not path_like:
+            return
+        path_obj = Path(path_like)
+        if not path_obj.is_absolute():
+            path_obj = crop_dir / path_obj
+        candidates.append(path_obj)
+
     crop_meta = record.get("crop") or {}
-    crop_filename = crop_meta.get("crop_filename")
-    if not crop_filename:
-        raise ValueError("Annotation has no crop_filename.")
-    crop_path = crop_dir / crop_filename
-    if not crop_path.exists():
-        raise FileNotFoundError(f"Crop image {crop_path} is missing.")
-    return crop_path, Image.open(crop_path).convert("RGB")
+    _push_candidate(crop_meta.get("crop_filename"))
+
+    image_filename = record.get("image_filename")
+    image_hash = record.get("image_hash")
+    if image_filename and image_hash:
+        stem = Path(image_filename).stem
+        _push_candidate(f"{stem}-{image_hash}-crop.png")
+
+    for mask in record.get("masks") or []:
+        mask_filename = (mask or {}).get("mask_filename")
+        if not mask_filename:
+            continue
+        mask_name = Path(mask_filename).name
+        if "-mask-" in mask_name:
+            prefix, _ = mask_name.split("-mask-", 1)
+            _push_candidate(f"{prefix}-crop.png")
+
+    seen = set()
+    unique_candidates = []
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        unique_candidates.append(candidate)
+
+    for crop_path in unique_candidates:
+        if crop_path.is_file():
+            return crop_path, Image.open(crop_path).convert("RGB")
+
+    if not unique_candidates:
+        raise ValueError(
+            "Annotation has no crop metadata and cannot infer a crop filename.")
+
+    tried = ", ".join(str(path) for path in unique_candidates)
+    raise FileNotFoundError(
+        f"Crop image not found for annotation (checked: {tried}).")
 
 
 def iter_annotations(json_files: Iterable[Path]) -> Iterable[Tuple[Path, dict]]:
